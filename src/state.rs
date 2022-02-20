@@ -1,345 +1,221 @@
-pub use crate::messages::*;
-pub use crate::*;
+use crate::file::*;
 
-use memmap2::MmapMut;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
-use std::net::SocketAddr;
-use std::path::Path;
+use laminar::{Packet as LaminarPacket, SocketEvent};
+use std::collections::{BTreeMap, HashSet};
+use std::io;
+use std::path::{Path, PathBuf};
 
-pub struct MappedFile {
-    pub inner: MmapMut,
-    pub name: String,
-    pub size: u32,
-    pub downloaded: bool,
-    pub pieces: Vec<Piece>,
-}
+use crossbeam_channel::Sender;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
-pub struct Piece {
-    pub hash: [u8; 16],
-    pub size: usize,
-    pub downloaded: bool,
-    pub pointer: RefCell<*const u8>,
-}
-
-impl MappedFile {
-    pub fn from_whole_file(f: &File, name: String) -> io::Result<(FileHash, MappedFile)> {
-        let mut file_hasher = Blake2s24::new();
-        let mut piece_hasher = Blake2s16::new();
-        let mmap = unsafe { MmapMut::map_mut(f)? };
-        let mut piece_pointers: Vec<Piece> = Vec::new();
-
-        for piece in mmap.chunks(CHUNK_SIZE) {
-            file_hasher.update(&piece);
-            piece_hasher.update(&piece);
-
-            piece_pointers.push(Piece {
-                hash: piece_hasher.finalize_reset().into(),
-                downloaded: true,
-                size: piece.len(),
-                pointer: RefCell::new(piece.as_ptr()),
-            });
-        }
-
-        Ok((
-            file_hasher.finalize().into(),
-            MappedFile {
-                inner: mmap,
-                name,
-                size: f.metadata()?.len() as u32,
-                downloaded: true,
-                pieces: piece_pointers,
-            },
-        ))
-    }
-
-    pub fn from_file_verified(
-        f: &File,
-        piece_hashes: &[[u8; 16]],
-        name: String,
-    ) -> io::Result<MappedFile> {
-        let mmap = unsafe { MmapMut::map_mut(f)? };
-        let piece_iter = mmap.chunks(CHUNK_SIZE);
-
-        if piece_hashes.len() != piece_iter.len() {
-            return Err(io::ErrorKind::InvalidInput.into());
-        }
-
-        let mut piece_hasher = Blake2s16::new();
-        let mut piece_pointers: Vec<Piece> = Vec::new();
-
-        for (i, piece) in piece_iter.enumerate() {
-            piece_hasher.update(&piece);
-
-            let hash = piece_hasher.finalize_reset().into();
-
-            piece_pointers.push(Piece {
-                hash,
-                downloaded: piece_hashes[i] == hash,
-                size: piece.len(),
-                pointer: RefCell::new(piece.as_ptr()),
-            });
-        }
-
-        Ok(MappedFile {
-            inner: mmap,
-            name,
-            size: f.metadata()?.len() as u32,
-            downloaded: piece_pointers.iter().all(|v| v.downloaded),
-            pieces: piece_pointers,
-        })
-    }
-
-    pub fn from_file_empty(
-        f: &File,
-        piece_hashes: &[[u8; 16]],
-        name: String,
-    ) -> io::Result<MappedFile> {
-        let mmap = unsafe { MmapMut::map_mut(f)? };
-        let piece_iter = mmap.chunks(CHUNK_SIZE);
-
-        if piece_hashes.len() != piece_iter.len() {
-            return Err(io::ErrorKind::InvalidInput.into());
-        }
-
-        let mut piece_pointers: Vec<Piece> = Vec::new();
-
-        for (i, piece) in piece_iter.enumerate() {
-            piece_pointers.push(Piece {
-                hash: piece_hashes[i],
-                downloaded: false,
-                size: piece.len(),
-                pointer: RefCell::new(piece.as_ptr()),
-            });
-        }
-
-        Ok(MappedFile {
-            inner: mmap,
-            name,
-            size: f.metadata()?.len() as u32,
-            downloaded: false,
-            pieces: piece_pointers,
-        })
-    }
-}
-
-#[derive(Default)]
-pub struct State {
-    pub files: HashMap<[u8; 24], MappedFile>,
+pub struct NyahState {
+    boxes: BTreeMap<BoxHash, CardboardBox>,
     pub peers: HashSet<SocketAddr>,
+    packet_sender: Sender<LaminarPacket>,
+    pub looking_for_boxes: BTreeMap<BoxHash, PathBuf>,
+    filter_from: Option<IpAddr> // filter events from this address
 }
 
-impl State {
-    pub fn add_whole_file(&mut self, path: impl AsRef<Path>) -> io::Result<[u8; 24]> {
-        let name = path
-            .as_ref()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let f = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .truncate(false)
-            .open(path)?;
+impl NyahState {
+    pub fn new(sender: Sender<LaminarPacket>, filter_from: Option<IpAddr>) -> NyahState {
+        NyahState {
+            packet_sender: sender,
+            peers: HashSet::new(),
+            boxes: BTreeMap::new(),
+            looking_for_boxes: BTreeMap::new(),
+            filter_from
+        }
+    }
+    
+    pub fn get_metadata(&self, key: BoxHash) -> Option<CardboardMetadata> {
+        self.boxes.get(&key).map(|v| v.metadata.clone())
+    }
 
-        let (hash, mfile) = MappedFile::from_whole_file(&f, name)?;
-
-        self.files.insert(hash, mfile);
+    pub fn create_box(
+        &mut self,
+        box_name: String,
+        box_dir: impl AsRef<Path>,
+    ) -> io::Result<BoxHash> {
+        let cardboard_box = CardboardBox::create(box_name, box_dir)?;
+        let hash = cardboard_box.hash;
+        self.boxes.insert(hash, cardboard_box);
 
         Ok(hash)
     }
 
-    pub fn create_or_add_file(
+    pub fn add_box(
         &mut self,
-        path: impl AsRef<Path>,
+        box_dir: impl AsRef<Path>,
         hash: [u8; 24],
-        metadata: FileMetadata,
+        metadata: CardboardMetadata,
     ) -> io::Result<()> {
-        let path = path.as_ref();
-        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
-        if path.is_file() {
-            let f = OpenOptions::new()
-                .write(true)
-                .read(true)
-                .truncate(false)
-                .open(path)?;
+        let cardboard_box = CardboardBox::from_metadata(box_dir, hash, metadata)?;
+        let hash = cardboard_box.hash;
+        self.boxes.insert(hash, cardboard_box);
 
-            f.set_len(metadata.size as u64)?;
-            self.files.insert(
-                hash,
-                MappedFile::from_file_verified(&f, &metadata.pieces, name)?,
-            );
-        } else {
-            let f = OpenOptions::new()
-                .write(true)
-                .read(true)
-                .create(true)
-                .open(path)?;
+        Ok(())
+    }
 
-            f.set_len(metadata.size as u64)?;
-            self.files.insert(
-                hash,
-                MappedFile::from_file_empty(&f, &metadata.pieces, name)?,
-            );
+    pub fn add_desired_box(&mut self, box_hash: BoxHash, box_dir: impl AsRef<Path>) {
+        self.looking_for_boxes.insert(box_hash, box_dir.as_ref().to_owned());
+    }
+
+    pub fn handle_packet(&mut self, event: SocketEvent) -> io::Result<()> {
+        match event {
+            SocketEvent::Packet(p) => {
+                if self.filter_from.as_ref().map(|ip| ip == &p.addr().ip()).unwrap_or(false) {
+                    return Ok(());
+                }
+
+                self.handle_msg(p.addr(), rmp_serde::from_read_ref(p.payload()).unwrap())?;
+            }
+            // SocketEvent::Disconnect(p) => {
+            //     self.peers.remove(&p);
+            // }
+            _ => (),
         }
 
         Ok(())
     }
 
-    pub fn get_metadata(&self, key: &[u8; 24]) -> Option<Vec<u8>> {
-        if let Some(f) = self.files.get(key) {
-            Some(
-                FileMetadata {
-                    name: f.name.clone(),
-                    size: f.size,
-                    pieces: f.pieces.iter().map(|v| v.hash).collect(),
+    pub fn handle_msg(&mut self, from: SocketAddr, message: Message) -> io::Result<()> {
+        use Message::*;
+        
+        match message {
+            SearchingForPeers => self.send_packet(ImHere.to_packet(from))?,
+            ImHere => { self.peers.insert(from); },
+            FindMetadata(hash) => {
+                if let Some(metadata) = self.get_metadata(hash) {
+                    println!("sending metadata");
+                    self.send_packet(GotMetadata(hash, metadata).to_packet(from))?;
                 }
-                .to_bytes(),
-            )
-        } else {
-            None
-        }
-    }
-
-    pub fn has_piece(&self, key: &[u8; 24], piece: u32) -> bool {
-        self.files
-            .get(key)
-            .and_then(|f| f.pieces.get(piece as usize).map(|v| v.downloaded))
-            .unwrap_or(false)
-    }
-
-    pub fn read_piece(&self, key: &[u8; 24], piece: u32) -> Option<&[u8]> {
-        if let Some(piece) = self.files.get(key).and_then(|f| {
-            f.pieces
-                .get(piece as usize)
-                .and_then(|v| if v.downloaded { Some(v) } else { None })
-        }) {
-            if let Ok(ptr) = piece.pointer.try_borrow() {
-                return Some(unsafe { std::slice::from_raw_parts(*ptr, piece.size) });
             }
-        }
-
-        None
-    }
-
-    pub fn write_piece(&self, key: &[u8; 24], piece: u32, data: &[u8]) -> bool {
-        if let Some(piece) = self.files.get(key).and_then(|f| {
-            f.pieces
-                .get(piece as usize)
-                .and_then(|v| if !v.downloaded { Some(v) } else { None })
-        }) {
-            if Blake2s16::digest(data).as_slice() != piece.hash {
-                return false;
-            }
-
-            if let Ok(ptr) = piece.pointer.try_borrow_mut() {
-                unsafe {
-                    (*ptr as *mut u8).copy_from(data.as_ptr(), piece.size);
+            GotMetadata(hash, metadata) => {
+                if let Some(path) = self.looking_for_boxes.remove(&hash) {
+                    println!("got metadata, adding box");
+                    self.add_box(path, hash, metadata)?;
                 }
-
-                return true;
             }
-        }
+            FindPiece {
+                id,
+                file_index,
+                piece_index,
+            } => {
+                if let Some(file) = self.boxes.get(&id).and_then(|b| b.files.get(file_index)) {
+                    if file.has_piece(piece_index) {
+                        println!("got req for piece, sending that we have it");
 
-        false
-    }
-
-    pub fn verify_piece(&mut self, key: &[u8; 24], piece_idx: u32) -> bool {
-        if self.files.contains_key(key) {
-            self.files[key].inner.flush().unwrap();
-        }
-
-        if let Some(piece) = self
-            .files
-            .get_mut(key)
-            .and_then(|f| f.pieces.get_mut(piece_idx as usize))
-        {
-            let ptr = piece.pointer.borrow();
-            let slice = unsafe { std::slice::from_raw_parts(*ptr, piece.size) };
-
-            if Blake2s16::digest(slice).as_slice() == piece.hash {
-                piece.downloaded = true;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
-
-    pub fn write_partial_piece(
-        &self,
-        key: &[u8; 24],
-        piece: u32,
-        offset: u32,
-        data: &[u8],
-    ) -> bool {
-        if let Some(piece) = self.files.get(key).and_then(|f| {
-            f.pieces
-                .get(piece as usize)
-                .and_then(|v| if !v.downloaded { Some(v) } else { None })
-        }) {
-            if let Ok(ptr) = piece.pointer.try_borrow_mut() {
-                unsafe {
-                    (*ptr as *mut u8)
-                        .add(offset as usize)
-                        .copy_from(data.as_ptr(), data.len());
+                        self.send_packet(
+                            GotPiece {
+                                id,
+                                file_index,
+                                piece_index,
+                            }
+                            .to_packet(from),
+                        )?;
+                    }
                 }
+            }
+            GotPiece {
+                id,
+                file_index,
+                piece_index,
+            } => {
+                if let Some(file) = self.boxes.get(&id).and_then(|b| b.files.get(file_index)) {
+                    if !file.has_piece(piece_index) {
+                        println!("peer has piece; starting download");
 
-                return true;
+                        self.send_packet(
+                            StartDownload {
+                                id,
+                                file_index,
+                                piece_index,
+                            }
+                            .to_packet(from),
+                        )?;
+                    }
+                }
+            }
+            StartDownload {
+                id,
+                file_index,
+                piece_index,
+            } => {
+                if let Some(data) = self
+                    .boxes
+                    .get(&id)
+                    .and_then(|b| b.files.get(file_index))
+                    .and_then(|f| f.read_piece(piece_index))
+                {
+                    println!("peer asked for download; uploading");
+                    for (i, ch) in data.chunks(CHUNK_SIZE).enumerate() {
+                        std::thread::sleep(Duration::from_millis(30)); // opencomputers can get overwhelmed if we go too fast here
+
+                        self.send_packet(
+                            Upload {
+                                id,
+                                file_index,
+                                piece_index,
+                                chunk_index: i,
+                                buf: ch.to_vec(),
+                            }
+                            .to_packet(from),
+                        )?;
+                    }
+                }
+            }
+            Upload {
+                id,
+                file_index,
+                piece_index,
+                chunk_index,
+                buf,
+            } => {
+                println!("peer sent us data, writing it");
+                if let Some(file) = self.boxes.get(&id).and_then(|b| b.files.get(file_index)) {
+                    if !file.has_piece(piece_index) {
+                        file.write_chunk(piece_index, chunk_index, &buf);
+                    }
+                }
             }
         }
 
-        false
+        Ok(())
     }
-}
 
-#[derive(Debug)]
-pub struct FileMetadata {
-    pub name: String,
-    pub size: u32,
-    pub pieces: Vec<[u8; 16]>,
-}
-
-impl FileMetadata {
-    pub fn from_bytes(mut bytes: &[u8]) -> io::Result<FileMetadata> {
-        let mut u32_buf: [u8; 4] = [0; 4];
-
-        bytes.read_exact(&mut u32_buf)?;
-        let mut string_buf = vec![0; u32::from_le_bytes(u32_buf) as usize];
-
-        bytes.read_exact(&mut string_buf)?;
-        let name = String::from_utf8(string_buf).unwrap();
-
-        bytes.read_exact(&mut u32_buf)?;
-        let file_size = u32::from_le_bytes(u32_buf);
-
-        let mut piece_hashes = Vec::with_capacity(bytes.len() / 16);
-        let mut piece_buf: [u8; 16] = [0; 16];
-
-        while !bytes.is_empty() {
-            bytes.read_exact(&mut piece_buf)?;
-            piece_hashes.push(std::mem::take(&mut piece_buf));
+    pub fn search_for_metadata(&self) -> io::Result<()> {
+        for k in self.looking_for_boxes.keys() {
+            for peer in &self.peers {
+                self.send_packet(Message::FindMetadata(*k).to_packet(*peer))?;
+            }
         }
 
-        Ok(FileMetadata {
-            name,
-            size: file_size,
-            pieces: piece_hashes,
-        })
+        Ok(())
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(8 + self.name.len() + self.pieces.len() * 16);
-        bytes.extend((self.name.len() as u32).to_le_bytes());
-        bytes.extend(self.name.as_bytes());
-        bytes.extend(self.size.to_le_bytes());
-        bytes.extend(self.pieces.iter().flatten());
-        bytes
+    pub fn search_for_pieces(&self) -> io::Result<()> {
+        for b in self.boxes.values() {
+            for (file_index, piece_indexes) in b.needed_pieces() {
+                for piece_index in piece_indexes {
+                    for peer in &self.peers {
+                        self.send_packet(Message::FindPiece { id: b.hash, file_index, piece_index}.to_packet(*peer))?;
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn search_for_peers(&self, addr: SocketAddr) -> io::Result<()> {
+        self.send_packet(LaminarPacket::unreliable(addr, rmp_serde::to_vec(&Message::SearchingForPeers).unwrap()))
+    }
+
+    fn send_packet(&self, packet: LaminarPacket) -> io::Result<()> {
+        self.packet_sender
+            .send(packet)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 }
