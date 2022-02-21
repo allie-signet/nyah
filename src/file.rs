@@ -33,7 +33,7 @@ pub struct MappedFile {
 
 impl MappedFile {
     pub fn from_whole_file(f: &File) -> io::Result<(FileHash, MappedFile)> {
-        let mut file_hasher = Blake2s24::new();
+        let mut file_hasher = Blake2s16::new();
         let mut piece_hasher = Blake2s16::new();
         let mmap = unsafe { MmapMut::map_mut(f)? };
         let mut piece_pointers = Vec::new();
@@ -165,8 +165,6 @@ impl MappedFile {
                 };
 
                 if !acquired.contains(&chunk_index) {
-                    println!("piece {piece_index}: writing chunk {chunk_index} out of {total}");
-
                     unsafe {
                         (*piece.pointer.borrow_mut() as *mut u8)
                             .add(chunk_index * CHUNK_SIZE)
@@ -186,10 +184,8 @@ impl MappedFile {
                         == piece.hash;
 
                     if digest {
-                        println!("piece {piece_index}: verify passed!");
                         *piece_state = PieceState::Downloaded;
                     } else {
-                        println!("piece {piece_index}: verify failed D:");
                         // if piece doesn't pass verification, clear it
                         acquired.clear();
                     }
@@ -201,7 +197,7 @@ impl MappedFile {
 
         false
     }
-    
+
     pub fn needed_pieces(&self) -> Vec<usize> {
         let mut pieces = Vec::new();
         for (i, piece) in self.pieces.iter().enumerate() {
@@ -217,7 +213,7 @@ impl MappedFile {
 // the torrent equivalent
 #[derive(Debug)]
 pub struct CardboardBox {
-    pub hash: [u8; 24],
+    pub hash: BoxHash,
     pub metadata: CardboardMetadata,
     pub base_path: PathBuf,
     pub files: Vec<MappedFile>,
@@ -236,7 +232,7 @@ impl CardboardBox {
         let mut files: Vec<MappedFile> = Vec::with_capacity(entries.len());
         let mut file_metadata: Vec<FileMetadata> = Vec::with_capacity(entries.len());
 
-        let mut hasher = Blake2s24::new();
+        let mut hasher = Blake2s16::new();
 
         for entry in entries {
             let f = OpenOptions::new()
@@ -248,6 +244,12 @@ impl CardboardBox {
 
             let (f_hash, mapped_file) = MappedFile::from_whole_file(&f)?;
             hasher.update(f_hash);
+
+            let entry = if entry.starts_with(dir.as_ref()) {
+                entry.strip_prefix(dir.as_ref()).unwrap().to_owned()
+            } else {
+                entry
+            };
 
             file_metadata.push(FileMetadata {
                 path: entry,
@@ -279,16 +281,18 @@ impl CardboardBox {
 
     pub fn from_metadata(
         dir: impl AsRef<Path>,
-        hash: [u8; 24],
+        hash: BoxHash,
         metadata: CardboardMetadata,
     ) -> io::Result<CardboardBox> {
         let mut files: Vec<MappedFile> = Vec::with_capacity(metadata.files.len());
 
+        dbg!(dir.as_ref());
         fs::create_dir_all(dir.as_ref())?;
 
         for entry in &metadata.files {
             let fpath = dir.as_ref().join(&entry.path);
-            
+            dbg!(&fpath);
+
             if let Some(p) = fpath.parent() {
                 fs::create_dir_all(p)?;
             }
@@ -317,9 +321,9 @@ impl CardboardBox {
         }
 
         Ok(CardboardBox {
-            hash: hash,
+            hash,
             base_path: dir.as_ref().to_owned(),
-            metadata: metadata,
+            metadata,
             files,
         })
     }
@@ -334,6 +338,27 @@ impl CardboardBox {
         }
 
         v
+    }
+
+    pub fn get_download_state(&self) -> BoxState {
+        BoxState {
+            name: self.metadata.name.clone(),
+            box_hash: self.hash,
+            files: self
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, file)| FileState {
+                    path: self.metadata.files[i].path.clone(),
+                    pieces_downloaded: file
+                        .pieces
+                        .iter()
+                        .filter(|v| *v.state.borrow() == PieceState::Downloaded)
+                        .count(),
+                    total_pieces: file.pieces.len(),
+                })
+                .collect(),
+        }
     }
 }
 

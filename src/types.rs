@@ -6,6 +6,39 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct BoxState {
+    pub name: String,
+    pub box_hash: BoxHash,
+    pub files: Vec<FileState>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FileState {
+    pub path: PathBuf,
+    pub pieces_downloaded: usize,
+    pub total_pieces: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum IPCResponse {
+    Ok,
+    NotFound,
+    BoxCreated(BoxHash),
+    Peers(Vec<SocketAddr>),
+    Box(BoxState),
+    Boxes(Vec<BoxState>),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum IPCCall {
+    CreateBox(String, PathBuf),
+    DownloadBox(BoxHash, PathBuf),
+    GetBoxState(BoxHash),
+    GetAllPeers,
+    GetAllBoxes,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub enum Message {
     SearchingForPeers,
     ImHere,

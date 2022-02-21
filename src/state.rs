@@ -10,11 +10,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 pub struct NyahState {
-    boxes: BTreeMap<BoxHash, CardboardBox>,
+    pub boxes: BTreeMap<BoxHash, CardboardBox>,
     pub peers: HashSet<SocketAddr>,
     packet_sender: Sender<LaminarPacket>,
     pub looking_for_boxes: BTreeMap<BoxHash, PathBuf>,
-    filter_from: Option<IpAddr> // filter events from this address
+    filter_from: Option<IpAddr>, // filter events from this address
 }
 
 impl NyahState {
@@ -24,10 +24,10 @@ impl NyahState {
             peers: HashSet::new(),
             boxes: BTreeMap::new(),
             looking_for_boxes: BTreeMap::new(),
-            filter_from
+            filter_from,
         }
     }
-    
+
     pub fn get_metadata(&self, key: BoxHash) -> Option<CardboardMetadata> {
         self.boxes.get(&key).map(|v| v.metadata.clone())
     }
@@ -47,7 +47,7 @@ impl NyahState {
     pub fn add_box(
         &mut self,
         box_dir: impl AsRef<Path>,
-        hash: [u8; 24],
+        hash: BoxHash,
         metadata: CardboardMetadata,
     ) -> io::Result<()> {
         let cardboard_box = CardboardBox::from_metadata(box_dir, hash, metadata)?;
@@ -58,13 +58,19 @@ impl NyahState {
     }
 
     pub fn add_desired_box(&mut self, box_hash: BoxHash, box_dir: impl AsRef<Path>) {
-        self.looking_for_boxes.insert(box_hash, box_dir.as_ref().to_owned());
+        self.looking_for_boxes
+            .insert(box_hash, box_dir.as_ref().to_owned());
     }
 
     pub fn handle_packet(&mut self, event: SocketEvent) -> io::Result<()> {
         match event {
             SocketEvent::Packet(p) => {
-                if self.filter_from.as_ref().map(|ip| ip == &p.addr().ip()).unwrap_or(false) {
+                if self
+                    .filter_from
+                    .as_ref()
+                    .map(|ip| ip == &p.addr().ip())
+                    .unwrap_or(false)
+                {
                     return Ok(());
                 }
 
@@ -81,19 +87,22 @@ impl NyahState {
 
     pub fn handle_msg(&mut self, from: SocketAddr, message: Message) -> io::Result<()> {
         use Message::*;
-        
+
         match message {
-            SearchingForPeers => self.send_packet(ImHere.to_packet(from))?,
-            ImHere => { self.peers.insert(from); },
+            SearchingForPeers => {
+                self.peers.insert(from);
+                self.send_packet(ImHere.to_packet(from))?
+            }
+            ImHere => {
+                self.peers.insert(from);
+            }
             FindMetadata(hash) => {
                 if let Some(metadata) = self.get_metadata(hash) {
-                    println!("sending metadata");
                     self.send_packet(GotMetadata(hash, metadata).to_packet(from))?;
                 }
             }
             GotMetadata(hash, metadata) => {
                 if let Some(path) = self.looking_for_boxes.remove(&hash) {
-                    println!("got metadata, adding box");
                     self.add_box(path, hash, metadata)?;
                 }
             }
@@ -104,8 +113,6 @@ impl NyahState {
             } => {
                 if let Some(file) = self.boxes.get(&id).and_then(|b| b.files.get(file_index)) {
                     if file.has_piece(piece_index) {
-                        println!("got req for piece, sending that we have it");
-
                         self.send_packet(
                             GotPiece {
                                 id,
@@ -124,8 +131,6 @@ impl NyahState {
             } => {
                 if let Some(file) = self.boxes.get(&id).and_then(|b| b.files.get(file_index)) {
                     if !file.has_piece(piece_index) {
-                        println!("peer has piece; starting download");
-
                         self.send_packet(
                             StartDownload {
                                 id,
@@ -148,7 +153,6 @@ impl NyahState {
                     .and_then(|b| b.files.get(file_index))
                     .and_then(|f| f.read_piece(piece_index))
                 {
-                    println!("peer asked for download; uploading");
                     for (i, ch) in data.chunks(CHUNK_SIZE).enumerate() {
                         std::thread::sleep(Duration::from_millis(30)); // opencomputers can get overwhelmed if we go too fast here
 
@@ -172,7 +176,6 @@ impl NyahState {
                 chunk_index,
                 buf,
             } => {
-                println!("peer sent us data, writing it");
                 if let Some(file) = self.boxes.get(&id).and_then(|b| b.files.get(file_index)) {
                     if !file.has_piece(piece_index) {
                         file.write_chunk(piece_index, chunk_index, &buf);
@@ -199,7 +202,14 @@ impl NyahState {
             for (file_index, piece_indexes) in b.needed_pieces() {
                 for piece_index in piece_indexes {
                     for peer in &self.peers {
-                        self.send_packet(Message::FindPiece { id: b.hash, file_index, piece_index}.to_packet(*peer))?;
+                        self.send_packet(
+                            Message::FindPiece {
+                                id: b.hash,
+                                file_index,
+                                piece_index,
+                            }
+                            .to_packet(*peer),
+                        )?;
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
@@ -210,7 +220,10 @@ impl NyahState {
     }
 
     pub fn search_for_peers(&self, addr: SocketAddr) -> io::Result<()> {
-        self.send_packet(LaminarPacket::unreliable(addr, rmp_serde::to_vec(&Message::SearchingForPeers).unwrap()))
+        self.send_packet(LaminarPacket::unreliable(
+            addr,
+            rmp_serde::to_vec(&Message::SearchingForPeers).unwrap(),
+        ))
     }
 
     fn send_packet(&self, packet: LaminarPacket) -> io::Result<()> {

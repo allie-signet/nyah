@@ -13,6 +13,8 @@ rmp-serde = "1.0.0"
 serde = { version = "1.0", features = ["derive"] }
 walkdir = "2"
 crossbeam-channel = "^0.5"
+argh = "0.1.7"
+libhumancode = "2.0"
 
 [profile.release]
 panic = "abort"
